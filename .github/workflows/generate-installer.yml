@@ -12,76 +12,88 @@ on:
           - Sonoma v14.7.6
           - Ventura v13.7.6
           - Monterey v12.7.4
-      file:
+      file-type:
         type: choice
-        description: "File Type"
+        description: "Installer Format"
         required: true
         options:
-          - ISO
           - DMG
+          - ISO
           - ZIP
 
-run-name: Generate macOS Installer - ${{ github.event.inputs.macos_version }} ${{ github.event.inputs.file }}
+run-name: Generate macOS Installer - ${{ github.event.inputs.macos_version }} (${{ github.event.inputs.file-type }})
+
+concurrency:
+  group: generate-macos-${{ github.event.inputs.macos_version }}-${{ github.event.inputs.file-type }}
+  cancel-in-progress: true
 
 env:
-  installer_version: "" # Do not touch: Populated by extract-details (suppresses warnings)
-  installer_name: "" # Do not touch: Populated by extract-details (suppresses warnings)
+  TEMP_DIR: /tmp/installer
 
 jobs:
   build:
     runs-on: macos-latest
-    if: github.repository == 'Comp-Labs/Download-macOS'
+    timeout-minutes: 60
+    if: github.repository == 'alsyundawy/MacOS-Downloader-Runner'
     steps:
-      - uses: actions/checkout@v4
-      
-      # Setup
-      - name: Extract Version Details
-        id: extract-details
-        run: |
-          string="${{ github.event.inputs.macos_version }}"
-          echo "installer_version=${string//*v/}" >> $GITHUB_ENV
-          echo "installer_name=${string// v*/}" >> $GITHUB_ENV
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      # Download Installer
-      - name: Download macOS Installer
+      - name: Extract installer details
+        id: extract
         run: |
-          softwareupdate --fetch-full-installer --full-installer-version ${{ env.installer_version }}
+          version="${{ github.event.inputs.macos_version }}"
+          # Extract numeric version (after 'v') and codename (before space)
+          installer_version=${version##*v}
+          installer_codename=${version%% v*}
+          file_type="${{ github.event.inputs.file-type }}"
+          # Normalize to lowercase
+          file_lc=$(echo "$file_type" | tr '[:upper:]' '[:lower:]')
+          echo "INSTALLER_VERSION=$installer_version" >> $GITHUB_ENV
+          echo "INSTALLER_CODENAME=$installer_codename" >> $GITHUB_ENV
+          echo "FILE_TYPE=$file_type" >> $GITHUB_ENV
+          echo "FILE_LC=$file_lc" >> $GITHUB_ENV
+          mkdir -p "$TEMP_DIR"
 
-      # Generate Installer
-      - if: github.event.inputs.file == 'dmg'
-        name: Generate macOS DMG Installer
+      - name: Download full macOS installer
         run: |
-          sudo hdiutil create -o /tmp/'${{ env.installer_name }}' -size 16384m -volname '${{ env.installer_name }}' -layout SPUD -fs HFS+J
-          sudo hdiutil attach /tmp/'${{ env.installer_name }}'.dmg -noverify -mountpoint /Volumes/'${{ env.installer_name }}'
-          sleep 10
-          sudo /Applications/'Install macOS ${{ env.installer_name }}'.app/Contents/Resources/createinstallmedia --volume /Volumes/'${{ env.installer_name }}' --nointeraction
-          hdiutil eject -force /Volumes/'Install macOS ${{ env.installer_name }}'
-          sudo mv /tmp/'${{ env.installer_name }}'.dmg ~/Desktop/'${{ env.installer_name }}'.dmg
+          softwareupdate --fetch-full-installer --full-installer-version ${{ env.INSTALLER_VERSION }}
 
-      - if: github.event.inputs.file == 'iso'
-        name: Generate macOS ISO Installer
+      - name: Prepare installer volume
         run: |
-          sudo hdiutil create -o /tmp/'${{ env.installer_name }}' -size 16384m -volname '${{ env.installer_name }}' -layout SPUD -fs HFS+J
-          sudo hdiutil attach /tmp/'${{ env.installer_name }}'.dmg -noverify -mountpoint /Volumes/'${{ env.installer_name }}'
-          sleep 20
-          sudo /Applications/'Install macOS ${{ env.installer_name }}'.app/Contents/Resources/createinstallmedia --volume /Volumes/'${{ env.installer_name }}' --nointeraction
-          echo "Sleeping 100 to allow the installer to finish"
-          sleep 100
-          hdiutil eject -force /Volumes/'Install macOS ${{ env.installer_name }}'
-          hdiutil convert /tmp/'${{ env.installer_name }}'.dmg -format UDTO -o ~/Desktop/'${{ env.installer_name }}'
-          mv -v ~/Desktop/'${{ env.installer_name }}'.cdr ~/Desktop/'${{ env.installer_name }}'.iso
-          sudo rm -fv /tmp/'${{ env.installer_name }}'.dmg
+          dmg_path="$TEMP_DIR/${{ env.INSTALLER_CODENAME }}.dmg"
+          hdiutil create -o "$dmg_path" -size 16384m -volname "${{ env.INSTALLER_CODENAME }}" -layout SPUD -fs HFS+J
+          hdiutil attach "$dmg_path" -noverify -mountpoint "/Volumes/${{ env.INSTALLER_CODENAME }}"
 
-      - if: github.event.inputs.file == 'zip'
-        name: Generate macOS ZIP Installer
+      - name: Create install media
         run: |
-          cd /Applications
-          zip -r 'Install macOS ${{ env.installer_name }}.zip' 'Install macOS ${{ env.installer_name }}.app'
-          mv -v 'Install macOS ${{ env.installer_name }}.zip' ~/Desktop/'${{ env.installer_name }}.zip'
+          sudo "/Applications/Install macOS ${{ env.INSTALLER_CODENAME }}.app/Contents/Resources/createinstallmedia" --volume "/Volumes/${{ env.INSTALLER_CODENAME }}" --nointeraction
+        env:
+          DETACH_TIMEOUT: 30
 
-      # Upload Installer
-      - name: Upload ${{ github.event.inputs.file }}
+      - name: Unmount volume
+        run: hdiutil detach "/Volumes/Install macOS ${{ env.INSTALLER_CODENAME }}" -force
+
+      - name: Generate output format
+        run: |
+          dmg_path="$TEMP_DIR/${{ env.INSTALLER_CODENAME }}.dmg"
+          desktop="${HOME}/Desktop"
+          case "${FILE_LC}" in
+            dmg)
+              mv "$dmg_path" "$desktop/${{ env.INSTALLER_CODENAME }}.dmg" ;;
+            iso)
+              iso_tmp="$TEMP_DIR/${{ env.INSTALLER_CODENAME }}.cdr"
+              hdiutil convert "$dmg_path" -format UDTO -o "$ISO_TMP="$TEMP_DIR/${{ env.INSTALLER_CODENAME }}""
+              mv "$ISO_TMP.cdr" "$desktop/${{ env.INSTALLER_CODENAME }}.iso"
+              ;; 
+            zip)
+              cd /Applications
+              zip -r "$desktop/${{ env.INSTALLER_CODENAME }}.zip" "Install macOS ${{ env.INSTALLER_CODENAME }}.app"
+              ;; 
+          esac
+
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: macOS ${{ env.installer_name }}
-          path: "~/Desktop/${{ env.installer_name }}.${{ github.event.inputs.file }}"
+          name: macOS-${{ env.INSTALLER_CODENAME }}-${{ env.FILE_LC }}
+          path: "${HOME}/Desktop/${{ env.INSTALLER_CODENAME }}.${{ env.FILE_LC }}"
